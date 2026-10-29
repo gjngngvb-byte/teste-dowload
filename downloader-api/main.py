@@ -5,7 +5,9 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
+
+import requests
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +29,7 @@ MAX_FILE_SIZE = 1_500_000_000
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "/etc/secrets/google-drive-credentials.json")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1TMEIFXjm_SBQT4wSq549XW_AJXQtpFKr")
 
-app = FastAPI(title="WenFetch pytubefix API", version="1.1.0")
+app = FastAPI(title="WenFetch Tunelio API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://wenfetch.vercel.app", "http://localhost:3000", "http://127.0.0.1:3000"],
@@ -83,52 +85,75 @@ def upload_to_google_drive(file_path: Path) -> dict:
 def download_job(job_id: str, url: str, fmt: str):
     job_dir = APP_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    JOBS[job_id].update(status="processing", message="Conectando ao YouTube e preparando o download.")
+    JOBS[job_id].update(status="processing", message="Solicitando o download à Tunelio.")
     try:
-        yt = YouTube(url, on_progress_callback=on_progress, use_oauth=False)
-        title = safe_title(yt.title)
-        if fmt == "mp3":
-            stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
-            if stream is None:
-                raise RuntimeError("Não foi encontrado um fluxo de áudio disponível para este vídeo.")
-            ext = stream.subtype or "mp4"
-            downloaded = Path(stream.download(output_path=str(job_dir), filename=f"{title}.{ext}"))
-            if downloaded.stat().st_size > MAX_FILE_SIZE:
+        api_key = os.getenv("TUNELIO_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("TUNELIO_API_KEY não está configurada no servidor Render.")
+
+        quality = "mp3" if fmt == "mp3" else fmt
+        response = requests.get(
+            "https://tunelio.dev/create",
+            params={"quality": quality, "url": url},
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+            timeout=(15, 90),
+        )
+        if not response.ok:
+            detail = ""
+            try:
+                body = response.json()
+                detail = str(body.get("message") or body.get("error") or body.get("detail") or "")
+            except Exception:
+                detail = response.text[:200]
+            raise RuntimeError(f"Tunelio recusou o pedido (HTTP {response.status_code}). {detail}".strip())
+
+        try:
+            data = response.json()
+        except ValueError:
+            raise RuntimeError("A Tunelio respondeu num formato inesperado, não JSON.")
+
+        download_url = data.get("url") or data.get("download_url")
+        if not isinstance(download_url, str) or not download_url.startswith("https://"):
+            raise RuntimeError("A Tunelio não devolveu uma URL HTTPS de download.")
+        filename = safe_title(str(data.get("filename") or "video"))
+        parsed_name = Path(filename)
+        ext = parsed_name.suffix.lower()
+        if ext not in {".mp4", ".webm", ".m4a", ".mp3", ".opus", ".mkv"}:
+            ext = ".mp3" if fmt == "mp3" else ".mp4"
+            filename = f"{parsed_name.stem or 'video'}{ext}"
+        destination = job_dir / filename
+
+        JOBS[job_id].update(message="Baixando o arquivo gerado pela Tunelio.")
+        total = 0
+        with requests.get(download_url, stream=True, timeout=(20, 180), allow_redirects=True) as file_response:
+            file_response.raise_for_status()
+            content_length = file_response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_FILE_SIZE:
                 raise RuntimeError("O arquivo excede o limite de 1,5 GB.")
-            if ext != "mp3":
-                import subprocess
-                mp3_path = job_dir / f"{title}.mp3"
-                proc = subprocess.run(["ffmpeg", "-y", "-i", str(downloaded), "-vn", "-b:a", "192k", str(mp3_path)], capture_output=True, text=True, timeout=7200)
-                if proc.returncode != 0 or not mp3_path.exists():
-                    raise RuntimeError("Não foi possível converter o áudio para MP3.")
-                downloaded.unlink(missing_ok=True)
-                downloaded = mp3_path
-        else:
-            height = int(fmt[:-1])
-            stream = yt.streams.filter(progressive=True, file_extension="mp4", res=f"{height}p").first()
-            if stream is None:
-                stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
-                if stream is not None:
-                    available_height = int(re.search(r"(\\d+)p", stream.resolution).group(1))
-                    candidates = yt.streams.filter(progressive=True, file_extension="mp4").filter(res=f"{min(height, available_height)}p")
-                    stream = candidates.first() or stream
-            if stream is None:
-                raise RuntimeError("Não há um formato MP4 progressivo compatível disponível para este vídeo.")
-            if stream.filesize and stream.filesize > MAX_FILE_SIZE:
-                raise RuntimeError("O arquivo excede o limite de 1,5 GB.")
-            downloaded = Path(stream.download(output_path=str(job_dir), filename=f"{title}.mp4"))
-        if not downloaded.exists() or downloaded.stat().st_size == 0:
-            raise RuntimeError("O download terminou sem gerar um arquivo.")
+            with destination.open("wb") as output:
+                for chunk in file_response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_FILE_SIZE:
+                        raise RuntimeError("O arquivo excede o limite de 1,5 GB.")
+                    output.write(chunk)
+
+        if not destination.exists() or destination.stat().st_size == 0:
+            raise RuntimeError("A Tunelio não entregou um arquivo válido para download.")
+
+        JOBS[job_id].update(message="Enviando o arquivo para o Google Drive.")
         drive_info = None
         drive_error = None
         try:
-            drive_info = upload_to_google_drive(downloaded)
+            drive_info = upload_to_google_drive(destination)
         except Exception as upload_exc:
             drive_error = (str(upload_exc).strip() or upload_exc.__class__.__name__)[:400]
+
         update = {
             "status": "completed",
-            "filename": downloaded.name,
-            "size": downloaded.stat().st_size,
+            "filename": destination.name,
+            "size": destination.stat().st_size,
             "message": "Download concluído e arquivo enviado ao Google Drive." if drive_info else "Download concluído, mas não foi possível enviar ao Google Drive.",
             "completed_at": time.time(),
         }
@@ -145,11 +170,11 @@ def download_job(job_id: str, url: str, fmt: str):
 
 @app.get("/")
 def root():
-    return {"service": "WenFetch pytubefix API", "status": "ok"}
+    return {"service": "WenFetch Tunelio API", "status": "ok"}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "library": "pytubefix"}
+    return {"status": "ok", "provider": "tunelio", "configured": bool(os.getenv("TUNELIO_API_KEY"))}
 
 @app.post("/api/download", status_code=202)
 async def create_download(payload: DownloadRequest):
