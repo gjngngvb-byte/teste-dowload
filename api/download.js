@@ -18,13 +18,19 @@ export default async function handler(req, res) {
   try {
     const upstream = await fetch("https://api.vidfetch.dev/v1/downloads", {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ url: parsed.toString(), format })
     });
-    const data = await upstream.json().catch(() => ({}));
+    const raw = await upstream.text();
+    let data = {};
+    try { data = raw ? JSON.parse(raw) : {}; } catch { data = {}; }
     if (!upstream.ok) {
+      const err = data.error ?? data.message ?? data.detail ?? data.description;
+      const message = typeof err === "string" ? err
+        : err && typeof err === "object" ? (err.message || err.detail || err.code || JSON.stringify(err))
+        : (raw && raw.trim() ? raw.trim().slice(0, 600) : `VidFetch respondeu com HTTP ${upstream.status}.`);
       return res.status(upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502)
-        .json({ error: data.error || data.message || `VidFetch respondeu com HTTP ${upstream.status}.` });
+        .json({ error: message, upstreamStatus: upstream.status, ...(data.code ? { code: data.code } : {}), ...(err && typeof err === "object" && err.code ? { code: err.code } : {}) });
     }
     return res.status(upstream.status === 202 ? 202 : 200).json(data);
   } catch {
