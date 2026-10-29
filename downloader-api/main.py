@@ -11,7 +11,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-import yt_dlp
+from pytubefix import YouTube
+from pytubefix.cli import on_progress
 
 APP_DIR = Path("/tmp/wenfetch")
 APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -19,20 +20,16 @@ JOBS = {}
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "21600"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+MAX_FILE_SIZE = 1_500_000_000
 
-app = FastAPI(title="WenFetch yt-dlp API", version="1.0.0")
+app = FastAPI(title="WenFetch pytubefix API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://wenfetch.vercel.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=["https://wenfetch.vercel.app", "http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
-
 
 class DownloadRequest(BaseModel):
     url: HttpUrl
@@ -43,73 +40,69 @@ def validate_youtube_url(url: str) -> str:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if parsed.scheme not in ("http", "https") or host not in {
-        "youtube.com", "www.youtube.com", "m.youtube.com",
-        "music.youtube.com", "youtu.be", "www.youtu.be",
+        "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be",
     }:
         raise HTTPException(status_code=400, detail="Por enquanto, aceitamos apenas links do YouTube.")
     return url
 
 
+def safe_title(title: str) -> str:
+    title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")
+    return (title or "video")[:150]
+
+
 def download_job(job_id: str, url: str, fmt: str):
     job_dir = APP_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    JOBS[job_id].update(status="processing", message="Baixando e preparando o arquivo.")
-    if fmt == "mp3":
-        output_template = str(job_dir / "%(title).150B.%(ext)s")
-        opts = {
-            "format": "bestaudio/best",
-            "outtmpl": output_template,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "restrictfilenames": True,
-            "max_filesize": 1_500_000_000,
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-        }
-    else:
-        height = int(fmt[:-1])
-        output_template = str(job_dir / "%(title).150B.%(ext)s")
-        opts = {
-            "format": f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
-            "merge_output_format": "mp4",
-            "outtmpl": output_template,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "restrictfilenames": True,
-            "max_filesize": 1_500_000_000,
-        }
+    JOBS[job_id].update(status="processing", message="Conectando ao YouTube e preparando o download.")
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        files = [p for p in job_dir.iterdir() if p.is_file() and p.stat().st_size > 0]
-        if not files:
+        yt = YouTube(url, on_progress_callback=on_progress, use_oauth=False)
+        title = safe_title(yt.title)
+        if fmt == "mp3":
+            stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+            if stream is None:
+                raise RuntimeError("Não foi encontrado um fluxo de áudio disponível para este vídeo.")
+            ext = stream.subtype or "mp4"
+            downloaded = Path(stream.download(output_path=str(job_dir), filename=f"{title}.{ext}"))
+            if downloaded.stat().st_size > MAX_FILE_SIZE:
+                raise RuntimeError("O arquivo excede o limite de 1,5 GB.")
+            if ext != "mp3":
+                import subprocess
+                mp3_path = job_dir / f"{title}.mp3"
+                proc = subprocess.run(["ffmpeg", "-y", "-i", str(downloaded), "-vn", "-b:a", "192k", str(mp3_path)], capture_output=True, text=True, timeout=7200)
+                if proc.returncode != 0 or not mp3_path.exists():
+                    raise RuntimeError("Não foi possível converter o áudio para MP3.")
+                downloaded.unlink(missing_ok=True)
+                downloaded = mp3_path
+        else:
+            height = int(fmt[:-1])
+            stream = yt.streams.filter(progressive=True, file_extension="mp4", res=f"{height}p").first()
+            if stream is None:
+                stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
+                if stream is not None:
+                    available_height = int(re.search(r"(\\d+)p", stream.resolution).group(1))
+                    candidates = yt.streams.filter(progressive=True, file_extension="mp4").filter(res=f"{min(height, available_height)}p")
+                    stream = candidates.first() or stream
+            if stream is None:
+                raise RuntimeError("Não há um formato MP4 progressivo compatível disponível para este vídeo.")
+            if stream.filesize and stream.filesize > MAX_FILE_SIZE:
+                raise RuntimeError("O arquivo excede o limite de 1,5 GB.")
+            downloaded = Path(stream.download(output_path=str(job_dir), filename=f"{title}.mp4"))
+        if not downloaded.exists() or downloaded.stat().st_size == 0:
             raise RuntimeError("O download terminou sem gerar um arquivo.")
-        result = max(files, key=lambda p: p.stat().st_size)
-        JOBS[job_id].update(
-            status="completed",
-            filename=result.name,
-            size=result.stat().st_size,
-            message="Arquivo pronto para baixar.",
-            completed_at=time.time(),
-        )
+        JOBS[job_id].update(status="completed", filename=downloaded.name, size=downloaded.stat().st_size, message="Arquivo pronto para baixar.", completed_at=time.time())
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
-        message = str(exc)
-        if len(message) > 500:
-            message = message[:500] + "…"
-        JOBS[job_id].update(status="failed", error=message, completed_at=time.time())
-
+        message = str(exc).strip() or exc.__class__.__name__
+        JOBS[job_id].update(status="failed", error=message[:500], completed_at=time.time())
 
 @app.get("/")
 def root():
-    return {"service": "WenFetch yt-dlp API", "status": "ok"}
-
+    return {"service": "WenFetch pytubefix API", "status": "ok"}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "yt_dlp_version": yt_dlp.version.__version__}
-
+    return {"status": "ok", "library": "pytubefix"}
 
 @app.post("/api/download", status_code=202)
 async def create_download(payload: DownloadRequest):
@@ -124,11 +117,9 @@ async def create_download(payload: DownloadRequest):
     asyncio.create_task(run_download(job_id, url, fmt))
     return {"id": job_id, "status": "queued"}
 
-
 async def run_download(job_id: str, url: str, fmt: str):
     async with semaphore:
         await asyncio.to_thread(download_job, job_id, url, fmt)
-
 
 @app.get("/api/status")
 def get_status(id: str):
@@ -140,7 +131,6 @@ def get_status(id: str):
         result["download_url"] = f"/api/file/{id}"
     return result
 
-
 @app.get("/api/file/{job_id}")
 def get_file(job_id: str):
     job = JOBS.get(job_id)
@@ -150,7 +140,6 @@ def get_file(job_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="O arquivo expirou. Envie o link novamente.")
     return FileResponse(path, filename=path.name, media_type="application/octet-stream")
-
 
 @app.on_event("startup")
 async def cleanup_loop():
