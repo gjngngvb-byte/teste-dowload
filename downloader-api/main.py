@@ -63,7 +63,7 @@ def upload_to_google_drive(file_path: Path) -> dict:
         raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID não foi configurado.")
     credentials = service_account.Credentials.from_service_account_file(
         GOOGLE_CREDENTIALS_FILE,
-        scopes=["https://www.googleapis.com/auth/drive.file"],
+        scopes=["https://www.googleapis.com/auth/drive"],
     )
     service = build("drive", "v3", credentials=credentials, cache_discovery=False)
     metadata = {"name": file_path.name, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
