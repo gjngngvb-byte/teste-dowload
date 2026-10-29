@@ -11,11 +11,11 @@ import requests
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, HttpUrl
 from pytubefix import YouTube
 from pytubefix.cli import on_progress
-from google.oauth2 import service_account
+from google.oauth2 import service_account, credentials as user_credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
@@ -28,6 +28,8 @@ semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 MAX_FILE_SIZE = 1_500_000_000
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "/etc/secrets/google-drive-credentials.json")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1TMEIFXjm_SBQT4wSq549XW_AJXQtpFKr")
+GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "https://wenfetch-ytdlp-api.onrender.com/auth/google/callback")
+OAUTH_STATES = {}
 
 app = FastAPI(title="WenFetch Tunelio API", version="1.2.0")
 app.add_middleware(
@@ -58,15 +60,25 @@ def safe_title(title: str) -> str:
     return (title or "video")[:150]
 
 
+def get_drive_credentials():
+    client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
+    refresh_token = os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN", "").strip()
+    if client_id and client_secret and refresh_token:
+        creds = user_credentials.Credentials(token=None, refresh_token=refresh_token, token_uri="https://oauth2.googleapis.com/token", client_id=client_id, client_secret=client_secret, scopes=["https://www.googleapis.com/auth/drive"])
+        from google.auth.transport.requests import Request
+        if not creds.valid:
+            creds.refresh(Request())
+        return creds
+    if Path(GOOGLE_CREDENTIALS_FILE).exists():
+        return service_account.Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=["https://www.googleapis.com/auth/drive"])
+    raise RuntimeError("OAuth do Google Drive não está configurado no Render.")
+
+
 def upload_to_google_drive(file_path: Path) -> dict:
-    if not Path(GOOGLE_CREDENTIALS_FILE).exists():
-        raise RuntimeError("Credencial do Google Drive não encontrada no Render.")
     if not GOOGLE_DRIVE_FOLDER_ID:
         raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID não foi configurado.")
-    credentials = service_account.Credentials.from_service_account_file(
-        GOOGLE_CREDENTIALS_FILE,
-        scopes=["https://www.googleapis.com/auth/drive"],
-    )
+    credentials = get_drive_credentials()
     service = build("drive", "v3", credentials=credentials, cache_discovery=False)
     metadata = {"name": file_path.name, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
     media = MediaFileUpload(str(file_path), resumable=True)
@@ -167,6 +179,36 @@ def download_job(job_id: str, url: str, fmt: str):
         shutil.rmtree(job_dir, ignore_errors=True)
         message = str(exc).strip() or exc.__class__.__name__
         JOBS[job_id].update(status="failed", error=message[:500], completed_at=time.time())
+
+@app.get("/auth/google/start")
+def google_oauth_start():
+    client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+    if not client_id:
+        raise HTTPException(status_code=503, detail="Configure GOOGLE_OAUTH_CLIENT_ID no Render.")
+    state = uuid.uuid4().hex
+    OAUTH_STATES[state] = time.time()
+    params = {"client_id": client_id, "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI, "response_type": "code", "scope": "https://www.googleapis.com/auth/drive", "access_type": "offline", "prompt": "consent", "state": state}
+    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params))
+
+
+@app.get("/auth/google/callback", response_class=HTMLResponse)
+def google_oauth_callback(code: str = "", state: str = "", error: str = ""):
+    if error:
+        raise HTTPException(status_code=400, detail="Autorização Google cancelada: " + error)
+    created = OAUTH_STATES.pop(state, None)
+    if not created or time.time() - created > 900:
+        raise HTTPException(status_code=400, detail="Estado OAuth inválido ou expirado. Inicie novamente.")
+    client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=503, detail="Configure Client ID e Client Secret no Render.")
+    token_response = requests.post("https://oauth2.googleapis.com/token", data={"code": code, "client_id": client_id, "client_secret": client_secret, "redirect_uri": GOOGLE_OAUTH_REDIRECT_URI, "grant_type": "authorization_code"}, timeout=30)
+    if not token_response.ok:
+        raise HTTPException(status_code=502, detail="Falha ao trocar código OAuth por token. Confira as credenciais e o URI de redirecionamento.")
+    refresh_token = token_response.json().get("refresh_token", "")
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="O Google não retornou refresh token. Revogue o acesso anterior do WenFetch e autorize novamente.")
+    return HTMLResponse("<h2>Autorização concluída</h2><p>Copie o token abaixo e salve no Render como GOOGLE_OAUTH_REFRESH_TOKEN. Não compartilhe este token.</p><textarea rows=5 cols=100 readonly>" + refresh_token + "</textarea>")
 
 @app.get("/")
 def root():
