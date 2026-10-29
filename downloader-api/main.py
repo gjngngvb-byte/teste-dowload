@@ -13,6 +13,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 from pytubefix import YouTube
 from pytubefix.cli import on_progress
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 APP_DIR = Path("/tmp/wenfetch")
 APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -21,6 +24,8 @@ JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", "21600"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 MAX_FILE_SIZE = 1_500_000_000
+GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "/etc/secrets/google-drive-credentials.json")
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1TMEIFXjm_SBQT4wSq549XW_AJXQtpFKr")
 
 app = FastAPI(title="WenFetch pytubefix API", version="1.1.0")
 app.add_middleware(
@@ -49,6 +54,30 @@ def validate_youtube_url(url: str) -> str:
 def safe_title(title: str) -> str:
     title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")
     return (title or "video")[:150]
+
+
+def upload_to_google_drive(file_path: Path) -> dict:
+    if not Path(GOOGLE_CREDENTIALS_FILE).exists():
+        raise RuntimeError("Credencial do Google Drive não encontrada no Render.")
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID não foi configurado.")
+    credentials = service_account.Credentials.from_service_account_file(
+        GOOGLE_CREDENTIALS_FILE,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+    metadata = {"name": file_path.name, "parents": [GOOGLE_DRIVE_FOLDER_ID]}
+    media = MediaFileUpload(str(file_path), resumable=True)
+    uploaded = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id,name,webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return {
+        "id": uploaded["id"],
+        "url": uploaded.get("webViewLink", f"https://drive.google.com/file/d/{uploaded['id']}/view"),
+    }
 
 
 def download_job(job_id: str, url: str, fmt: str):
@@ -90,7 +119,25 @@ def download_job(job_id: str, url: str, fmt: str):
             downloaded = Path(stream.download(output_path=str(job_dir), filename=f"{title}.mp4"))
         if not downloaded.exists() or downloaded.stat().st_size == 0:
             raise RuntimeError("O download terminou sem gerar um arquivo.")
-        JOBS[job_id].update(status="completed", filename=downloaded.name, size=downloaded.stat().st_size, message="Arquivo pronto para baixar.", completed_at=time.time())
+        drive_info = None
+        drive_error = None
+        try:
+            drive_info = upload_to_google_drive(downloaded)
+        except Exception as upload_exc:
+            drive_error = (str(upload_exc).strip() or upload_exc.__class__.__name__)[:400]
+        update = {
+            "status": "completed",
+            "filename": downloaded.name,
+            "size": downloaded.stat().st_size,
+            "message": "Download concluído e arquivo enviado ao Google Drive." if drive_info else "Download concluído, mas não foi possível enviar ao Google Drive.",
+            "completed_at": time.time(),
+        }
+        if drive_info:
+            update["drive_url"] = drive_info["url"]
+            update["drive_file_id"] = drive_info["id"]
+        if drive_error:
+            update["drive_error"] = drive_error
+        JOBS[job_id].update(**update)
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         message = str(exc).strip() or exc.__class__.__name__
@@ -129,6 +176,10 @@ def get_status(id: str):
     result = {k: v for k, v in job.items() if k not in {"created_at", "completed_at", "filename"}}
     if job.get("status") == "completed":
         result["download_url"] = f"/api/file/{id}"
+        if job.get("drive_url"):
+            result["drive_url"] = job["drive_url"]
+        if job.get("drive_error"):
+            result["drive_error"] = job["drive_error"]
     return result
 
 @app.get("/api/file/{job_id}")
