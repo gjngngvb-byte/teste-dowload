@@ -28,6 +28,7 @@ semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 MAX_FILE_SIZE = 1_500_000_000
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "/etc/secrets/google-drive-credentials.json")
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "/etc/secrets/youtube-cookies.txt")
+YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1TMEIFXjm_SBQT4wSq549XW_AJXQtpFKr")
 GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "https://wenfetch-ytdlp-api.onrender.com/auth/google/callback")
 OAUTH_STATES = {}
@@ -135,6 +136,9 @@ def download_job(job_id: str, url: str, fmt: str):
             "progress_hooks": [progress_hook],
             "socket_timeout": 30,
         }
+        # Rota opcional exclusiva do yt-dlp; Google Drive e OAuth continuam sem proxy.
+        if YTDLP_PROXY:
+            ydl_options["proxy"] = YTDLP_PROXY
         cookies_path = Path(YOUTUBE_COOKIES_FILE)
         if cookies_path.is_file():
             ydl_options["cookiefile"] = str(cookies_path)
