@@ -27,11 +27,12 @@ MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 MAX_FILE_SIZE = 1_500_000_000
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "/etc/secrets/google-drive-credentials.json")
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "/etc/secrets/youtube-cookies.txt")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1TMEIFXjm_SBQT4wSq549XW_AJXQtpFKr")
 GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "https://wenfetch-ytdlp-api.onrender.com/auth/google/callback")
 OAUTH_STATES = {}
 
-app = FastAPI(title="WenFetch yt-dlp API", version="2.0.0")
+app = FastAPI(title="WenFetch yt-dlp API", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://wenfetch.vercel.app", "http://localhost:3000", "http://127.0.0.1:3000"],
@@ -134,6 +135,9 @@ def download_job(job_id: str, url: str, fmt: str):
             "progress_hooks": [progress_hook],
             "socket_timeout": 30,
         }
+        cookies_path = Path(YOUTUBE_COOKIES_FILE)
+        if cookies_path.is_file():
+            ydl_options["cookiefile"] = str(cookies_path)
         if fmt == "mp3":
             ydl_options["postprocessors"] = [{
                 "key": "FFmpegExtractAudio",
