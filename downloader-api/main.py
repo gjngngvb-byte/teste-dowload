@@ -8,6 +8,8 @@ from pathlib import Path
 from urllib.parse import urlparse, urlencode
 
 import requests
+import yt_dlp
+from yt_dlp.utils import DownloadError
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,7 +33,7 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1TMEIFXjm_SBQT4wSq
 GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "https://wenfetch-ytdlp-api.onrender.com/auth/google/callback")
 OAUTH_STATES = {}
 
-app = FastAPI(title="WenFetch Tunelio API", version="1.2.0")
+app = FastAPI(title="WenFetch yt-dlp API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://wenfetch.vercel.app", "http://localhost:3000", "http://127.0.0.1:3000"],
@@ -97,62 +99,68 @@ def upload_to_google_drive(file_path: Path) -> dict:
 def download_job(job_id: str, url: str, fmt: str):
     job_dir = APP_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    JOBS[job_id].update(status="processing", message="Solicitando o download à Tunelio.")
+    JOBS[job_id].update(status="processing", message="Preparando download direto com yt-dlp.")
     try:
-        api_key = os.getenv("TUNELIO_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("TUNELIO_API_KEY não está configurada no servidor Render.")
+        def progress_hook(data):
+            if data.get("status") == "downloading":
+                total = data.get("total_bytes") or data.get("total_bytes_estimate")
+                downloaded = data.get("downloaded_bytes", 0)
+                if total:
+                    percent = min(99, int(downloaded * 100 / total))
+                    JOBS[job_id].update(message=f"Baixando com yt-dlp: {percent}%")
+                else:
+                    JOBS[job_id].update(message="Baixando vídeo com yt-dlp.")
+            elif data.get("status") == "finished":
+                JOBS[job_id].update(message="Download recebido. Preparando arquivo.")
 
-        quality = "mp3" if fmt == "mp3" else fmt
-        response = requests.get(
-            "https://tunelio.dev/create",
-            params={"quality": quality, "url": url},
-            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-            timeout=(15, 90),
-        )
-        if not response.ok:
-            detail = ""
-            try:
-                body = response.json()
-                detail = str(body.get("message") or body.get("error") or body.get("detail") or "")
-            except Exception:
-                detail = response.text[:200]
-            raise RuntimeError(f"Tunelio recusou o pedido (HTTP {response.status_code}). {detail}".strip())
+        if fmt == "mp3":
+            format_selector = "bestaudio/best"
+        else:
+            height = int(fmt.replace("p", ""))
+            format_selector = (
+                f"bestvideo[height<={height}]+bestaudio/"
+                f"best[height<={height}][ext=mp4]/best[height<={height}]/best"
+            )
 
-        try:
-            data = response.json()
-        except ValueError:
-            raise RuntimeError("A Tunelio respondeu num formato inesperado, não JSON.")
+        ydl_options = {
+            "format": format_selector,
+            "outtmpl": str(job_dir / "%(title).150B [%(id)s].%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            "continuedl": True,
+            "max_filesize": MAX_FILE_SIZE,
+            "merge_output_format": "mp4",
+            "progress_hooks": [progress_hook],
+            "socket_timeout": 30,
+        }
+        if fmt == "mp3":
+            ydl_options["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }]
 
-        download_url = data.get("url") or data.get("download_url")
-        if not isinstance(download_url, str) or not download_url.startswith("https://"):
-            raise RuntimeError("A Tunelio não devolveu uma URL HTTPS de download.")
-        filename = safe_title(str(data.get("filename") or "video"))
-        parsed_name = Path(filename)
-        ext = parsed_name.suffix.lower()
-        if ext not in {".mp4", ".webm", ".m4a", ".mp3", ".opus", ".mkv"}:
-            ext = ".mp3" if fmt == "mp3" else ".mp4"
-            filename = f"{parsed_name.stem or 'video'}{ext}"
-        destination = job_dir / filename
+        JOBS[job_id].update(message="Conectando ao YouTube com yt-dlp.")
+        with yt_dlp.YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(url, download=True)
+            prepared = Path(ydl.prepare_filename(info))
+        if fmt == "mp3":
+            destination = prepared.with_suffix(".mp3")
+        else:
+            destination = prepared.with_suffix(".mp4") if prepared.with_suffix(".mp4").exists() else prepared
+        if not destination.exists():
+            candidates = [p for p in job_dir.iterdir() if p.is_file()]
+            if not candidates:
+                raise RuntimeError("yt-dlp terminou sem produzir um arquivo.")
+            destination = max(candidates, key=lambda p: p.stat().st_size)
 
-        JOBS[job_id].update(message="Baixando o arquivo gerado pela Tunelio.")
-        total = 0
-        with requests.get(download_url, stream=True, timeout=(20, 180), allow_redirects=True) as file_response:
-            file_response.raise_for_status()
-            content_length = file_response.headers.get("Content-Length")
-            if content_length and int(content_length) > MAX_FILE_SIZE:
-                raise RuntimeError("O arquivo excede o limite de 1,5 GB.")
-            with destination.open("wb") as output:
-                for chunk in file_response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > MAX_FILE_SIZE:
-                        raise RuntimeError("O arquivo excede o limite de 1,5 GB.")
-                    output.write(chunk)
-
-        if not destination.exists() or destination.stat().st_size == 0:
-            raise RuntimeError("A Tunelio não entregou um arquivo válido para download.")
+        if destination.stat().st_size == 0:
+            raise RuntimeError("O YouTube não entregou um arquivo válido.")
+        if destination.stat().st_size > MAX_FILE_SIZE:
+            raise RuntimeError("O arquivo excede o limite de 1,5 GB.")
 
         JOBS[job_id].update(message="Enviando o arquivo para o Google Drive.")
         drive_info = None
@@ -166,7 +174,7 @@ def download_job(job_id: str, url: str, fmt: str):
             "status": "completed",
             "filename": destination.name,
             "size": destination.stat().st_size,
-            "message": "Download concluído e arquivo enviado ao Google Drive." if drive_info else "Download concluído, mas não foi possível enviar ao Google Drive.",
+            "message": "Download concluído com yt-dlp e enviado ao Google Drive." if drive_info else "Download concluído, mas não foi possível enviar ao Google Drive.",
             "completed_at": time.time(),
         }
         if drive_info:
@@ -178,6 +186,8 @@ def download_job(job_id: str, url: str, fmt: str):
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         message = str(exc).strip() or exc.__class__.__name__
+        if isinstance(exc, DownloadError):
+            message = f"yt-dlp não conseguiu baixar este vídeo: {message}"
         JOBS[job_id].update(status="failed", error=message[:500], completed_at=time.time())
 
 @app.get("/auth/google/start")
@@ -212,11 +222,11 @@ def google_oauth_callback(code: str = "", state: str = "", error: str = ""):
 
 @app.get("/")
 def root():
-    return {"service": "WenFetch Tunelio API", "status": "ok"}
+    return {"service": "WenFetch yt-dlp API", "status": "ok"}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "provider": "tunelio", "configured": bool(os.getenv("TUNELIO_API_KEY"))}
+    return {"status": "ok", "provider": "yt-dlp", "configured": True}
 
 @app.post("/api/download", status_code=202)
 async def create_download(payload: DownloadRequest):
