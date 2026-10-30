@@ -15,8 +15,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, HttpUrl
-from pytubefix import YouTube
-from pytubefix.cli import on_progress
 from google.oauth2 import service_account, credentials as user_credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -58,7 +56,7 @@ def validate_youtube_url(url: str) -> str:
 
 
 def safe_title(title: str) -> str:
-    title = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", title).strip(" .")
+    title = re.sub(r'[\\\\/:*?"<>|\\x00-\\x1f]', "_", title).strip(" .")
     return (title or "video")[:150]
 
 
